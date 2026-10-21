@@ -238,7 +238,14 @@ After the previous job exits:
 Resume uses the saved code, config and Python path, verifies the saved run-file
 hashes at submission (each task verifies its input shard at job start), and
 refuses to overlap a recorded active job. Committed parts are skipped;
-an interrupted uncommitted batch may be recomputed. Changed model, config, code,
+an interrupted uncommitted batch may be recomputed. Before loading the model, a
+worker validates every selected unit, which tokenizes the whole shard; after it
+passes, `outputs/worker-*/validated.json` records the run identity, the runtime
+versions and hashes of the model's tokenizer and chat-template files, and a
+resume with the same record skips that pass. `--validate-only`
+always validates and writes the record in its own output directory, so copying a
+preflight's record into a new run's worker directory also skips the pass at first
+launch. A record that does not match is ignored. Changed model, config, code,
 or input requires a new run directory. The launcher records the Python path,
 not a hash of the full runtime/model contents; those must not be modified in place.
 Directory aliases are resolved at submission so switching a release symlink does
@@ -267,7 +274,27 @@ smoke run to check a model profile and runtime on the target cluster.
 vLLM schedules requests within each worker. `host_batch_records` and
 `host_batch_tokens` control checkpoint size and host memory; `max_num_seqs`
 controls GPU request concurrency. A larger host batch amortizes overhead but
-increases recomputation after interruption. Balance shards by expected token work and keep requests with
+increases recomputation after interruption.
+
+By default (`"feed": {"mode": "batch"}`) the runner submits one host batch and
+waits for its slowest unit before starting the next, so the GPU idles while the
+last long generations finish. On urlquery.net (October 2026) a worker had at most
+four running requests and none waiting in 31% of engine samples. `"feed": {"mode":
+"continuous", "commit_seconds": 60}` keeps up to `host_batch_records` units and
+`host_batch_tokens` prompt tokens in flight and adds the next unit as each one
+finishes: the iteration-level scheduling of Orca (OSDI 2022) that vLLM applies
+inside the engine, extended to the host. It sends the rendered prompt token IDs
+through `LLMEngine.add_request`/`step` with the same sampling parameters, commits
+finished units every `commit_seconds` (or `host_batch_records` units), and once
+draining or stopping commits each unit as it finishes, so an interruption loses
+only unfinished units. Prompts, sampling parameters, seeds, retries and result
+rows are the same as with batches. Generated tokens are equivalent rather than
+bit-identical, as between any two batch compositions, because GPU kernels are not
+batch-invariant. The feed skips vLLM's own chat rendering, so before adopting it
+compare `prompt_token_ids` from a batch run with the feed's IDs for the same units
+on one GPU. `batch_seconds` in `timings.jsonl` is the slowest unit's time in
+flight, which sets the drain margin. The feed is part of the configuration, so a
+run keeps the feed it started with. Balance shards by expected token work and keep requests with
 shared prompt prefixes adjacent to improve prefix-cache reuse. Resume keeps
 compact per-unit hashes, status and token counts in memory; full outputs stay
 on disk. Use bounded shards for very large workloads.
@@ -276,7 +303,23 @@ Tensor, pipeline and data parallel sizes must each be 1 for this launcher.
 
 The 262K context and batch limits are specific to the supplied model profile.
 Tune context, `max_num_seqs` and `max_num_batched_tokens` using representative
-token lengths, throughput, preemption metrics and memory headroom. Preserve the compile cache between jobs.
+token lengths, throughput, preemption metrics and memory headroom. The right
+`max_num_seqs` depends on prompt length. With short prompts (about 1K tokens,
+dorfwiki.org) workers sat at the 16-request cap in 85% of engine samples, with
+16 or more waiting in 78% and median KV-cache use of 15%, and no preemptions; a
+higher cap is worth a trial there. With long prompts (mean 65K tokens,
+urlquery.net) the KV cache is the limit: one worker logged 204 preemptions at 16,
+so a higher cap would add recomputation.
+
+Prefix caching on this hybrid model reuses linear-attention (Mamba-style) state
+only where vLLM kept a checkpoint (`mamba_cache_mode=align`, with
+`prefix_cache_retention_interval=0` keeping only semantic checkpoints). Requests
+that share a long evidence prefix and differ only in a trailing question therefore
+reuse less of it than with a pure-attention model: urlquery.net and dorfwiki.org
+both logged a hit rate of about 33%. Periodic checkpoints
+(`prefix_cache_retention_interval`) could raise reuse but take cache space, and
+Marconi (MLSys 2025) found that frequent checkpoints thrash the cache, so measure
+hit rate, preemptions and throughput on one GPU before adopting them. Preserve the compile cache between jobs.
 Keep `kv_cache_dtype=auto` unless a separate quantized-cache trial establishes
 quality and memory behavior. See vLLM's [offline inference](https://docs.vllm.ai/en/v0.31.0/serving/offline_inference/),
 [structured outputs](https://docs.vllm.ai/en/v0.31.0/features/structured_outputs/),

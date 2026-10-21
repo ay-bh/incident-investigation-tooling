@@ -252,6 +252,21 @@ def engine_options(config):
     return options
 
 
+def feed_options(config):
+    """How work reaches vLLM. 'batch' (default) submits one host batch and waits for its
+    slowest unit; 'continuous' keeps up to a host batch of units in flight, adds the next
+    as each finishes, and commits finished units every commit_seconds."""
+    feed = config.get('feed', {})
+    if not isinstance(feed, dict) or set(feed) - {'mode', 'commit_seconds'}:
+        raise ValueError('feed accepts mode and commit_seconds only')
+    mode, seconds = feed.get('mode', 'batch'), feed.get('commit_seconds', 60)
+    if mode not in ('batch', 'continuous'):
+        raise ValueError("feed.mode must be 'batch' or 'continuous'")
+    if type(seconds) not in (int, float) or not 0 < seconds < math.inf:
+        raise ValueError('feed.commit_seconds must be a positive number')
+    return {'mode': mode, 'commit_seconds': seconds}
+
+
 def decoding_controls(config):
     """Validate the opt-in decoding controls; absent keys keep legacy behaviour."""
     sampling = config['sampling']
@@ -403,8 +418,8 @@ def budget_exhausted(answer, fields, budget, end_ids, start):
     return ids[-len(end_ids):] == end_ids and n - opener - len(end_ids) >= budget
 
 
-def batches(rows, tokenizer, config, skip):
-    batch, count = [], 0
+def prepared(rows, tokenizer, config, skip):
+    """(row, chat, prompt token IDs) for each unit not in skip, checked against the context limits."""
     for row in rows:
         if row['unit_id'] in skip:
             continue
@@ -424,6 +439,13 @@ def batches(rows, tokenizer, config, skip):
             raise ValueError(f'Oversize unit {row["unit_id"]}: {tokens} prompt tokens')
         if tokens > config['host_batch_tokens']:
             raise ValueError('Single unit exceeds configured host batch token cap')
+        yield row, chat, ids
+
+
+def batches(rows, tokenizer, config, skip):
+    batch, count = [], 0
+    for row, chat, ids in prepared(rows, tokenizer, config, skip):
+        tokens = len(ids)
         if batch and (len(batch) >= config['host_batch_records'] or
                       count + tokens > config['host_batch_tokens']):
             yield batch
@@ -468,6 +490,32 @@ def metrics_snapshot(llm, enabled=True):
             metrics.append({'name': name, 'value': value, 'labels': getattr(metric, 'labels', {})})
     preempt = [m['value'] for m in metrics if 'preempt' in m['name']]
     return {'available': True, 'preemptions': sum(preempt) if preempt else None, 'metrics': metrics}
+
+
+TOKENIZER_FILES = ('tokenizer', 'chat_template', 'special_tokens_map', 'added_tokens', 'vocab', 'merges')
+
+
+def runtime(model):
+    """Interpreter, validation libraries and the model's tokenizer and chat-template files;
+    a validation record from another runtime is not reused."""
+    from importlib import metadata
+    versions = {}
+    for name in ('transformers', 'tokenizers', 'jinja2', 'jsonschema'):
+        try:
+            versions[name] = metadata.version(name)
+        except metadata.PackageNotFoundError:
+            versions[name] = None
+    files = {}
+    with contextlib.suppress(FileNotFoundError, NotADirectoryError):
+        files = {p.name: file_hash(p) for p in sorted(Path(model).iterdir())
+                 if p.is_file() and p.name.startswith(TOKENIZER_FILES)}
+    return {'python': sys.version, 'executable': sys.executable, **versions, 'tokenizer_files': files}
+
+
+def recorded(path):
+    """A JSON record, or None when it is missing or unreadable."""
+    with contextlib.suppress(FileNotFoundError, ValueError):
+        return json.loads(Path(path).read_text())
 
 
 def job_deadline(stop_at):
@@ -516,6 +564,7 @@ def run(resources):
     # Offline LLM defaults to disabled statistics when the option is omitted.
     metrics_enabled = not resolved_engine.get('disable_log_stats', True)
     controls = decoding_controls(config)
+    feed = feed_options(config)
     identity_data = {'config': config, 'manifest_hash': file_hash(args.fixtures),
                      'runner_hash': file_hash(__file__), 'max_records': args.max_records}
     identity = digest(json.dumps(identity_data, sort_keys=True).encode())
@@ -551,9 +600,16 @@ def run(resources):
         input_info[r['unit_id']] = fingerprint(r)
         per_unit = 'body' in r  # units() guarantees one row kind per manifest
     legacy = not per_unit and controls['attempts'] == 1
-    for batch in batches(units(args.fixtures, args.max_records), tokenizer, config, {}):
-        for row, _, _ in batch:
-            validator_for(row)
+    # The full pass tokenizes every unit (about 20 minutes on a large shard). A record
+    # for this identity and runtime proves it passed, so a resume skips it; the
+    # generation loop still checks each batch it renders.
+    validation_path = directory / 'validated.json'
+    validation = {'identity': identity, 'units': len(input_info), 'runtime': runtime(config['model'])}
+    if args.validate_only or recorded(validation_path) != validation:
+        for batch in batches(units(args.fixtures, args.max_records), tokenizer, config, {}):
+            for row, _, _ in batch:
+                validator_for(row)
+        write_json(validation_path, validation)
     if args.validate_only:
         print(json.dumps({'event': 'validated', 'units': len(input_info), 'identity': identity}), flush=True)
         return
@@ -619,6 +675,10 @@ def run(resources):
         if 'repetition_detection' in base_sampling:
             from vllm.sampling_params import RepetitionDetectionParams
             base_sampling['repetition_detection'] = RepetitionDetectionParams(**base_sampling['repetition_detection'])
+        if feed['mode'] == 'continuous':
+            from vllm.sampling_params import RequestOutputKind
+            # LLM.chat sets this on its own requests; engine requests ask for it explicitly.
+            base_sampling['output_kind'] = RequestOutputKind.FINAL_ONLY
 
         def sampling_for(row, attempt):
             kwargs = dict(base_sampling)
@@ -643,93 +703,70 @@ def run(resources):
         if not legacy:
             startup['decoding_controls'] = controls
         write_json(directory / f'startup-{os.environ.get("SLURM_JOB_ID", os.getpid())}.json', startup)
-        for batch in batches(units(args.fixtures, args.max_records), tokenizer, config, done):
-            if stopping or time.time() >= drain_at():
-                break
-            begin = time.monotonic()
-            print(json.dumps({'event': 'batch_start', 'utc': now(), 'committed': len(done),
-                              'units': len(batch), 'prompt_tokens': sum(b[2] for b in batch)}), flush=True)
-            # Model-output failures are re-run within the batch, before commit, so
-            # resume semantics are unchanged: committed rows are never retried.
-            results, pending, history = [None] * len(batch), list(range(len(batch))), {}
-            for attempt in range(1, controls['attempts'] + 1):
-                # Finish committing the completed attempt rather than start more
-                # GPU work after a stop request or deadline.
-                if attempt > 1 and (stopping or time.time() >= drain_at()):
-                    break
-                params = sampling if legacy else [
-                    sampling if sampling is not None and attempt == 1 else sampling_for(batch[i][0], attempt)
-                    for i in pending]
-                attempt_started = time.monotonic()
-                outputs = llm.chat([batch[i][1] for i in pending], sampling_params=params,
-                                   chat_template_kwargs=config['chat_template_kwargs'], use_tqdm=False)
-                longest_batch_seconds = max(longest_batch_seconds, time.monotonic() - attempt_started)
-                if len(outputs) != len(pending):
-                    raise RuntimeError('Missing model outputs; batch not committed')
-                retry = []
-                for i, output in zip(pending, outputs):
-                    row, chat, count = batch[i]
-                    if len(output.outputs) != 1:
-                        raise RuntimeError('Expected exactly one model output per unit; batch not committed')
-                    answer = output.outputs[0]
-                    if answer.finish_reason not in ('stop', 'length', 'repetition'):
-                        raise RuntimeError(f'Engine terminated generation ({answer.finish_reason}); '
-                                           'batch not committed, resume to regenerate it')
-                    parsed, error, answer_fields = validate_answer(
-                        answer, output.prompt_token_ids, count, tokenizer, validator_for(row), enabled)
-                    logprobs = None
-                    if not error and top_logprobs(row) is not None:
-                        try:
-                            logprobs = final_logprobs(answer, answer_fields['reasoning_tokens'] or 0,
-                                                     getattr(tokenizer, 'all_special_ids', ()))
-                        except ValueError as exc:
-                            parsed, error = None, failure(exc)
-                    status = 'failed' if error else 'success'
-                    if 'body' in row:
-                        # Request rows use the batch-result shape (README.md#result-rows).
-                        result = {'run_identity': identity, 'unit_id': row['unit_id'],
-                                  'custom_id': row['custom_id'], 'request_sha256': row['request_sha256'],
-                                  # The rejected answer stays in content and raw_output.
-                                  'status': status, 'result': None if error else parsed, 'error': error,
-                                  'content': answer_fields['final_output'],
-                                  'reasoning': answer_fields['reasoning'],
-                                  'reasoning_complete': answer_fields['reasoning_complete'],
-                                  'finish_reason': answer.finish_reason,
-                                  'usage': {'prompt_tokens': count, 'completion_tokens': len(answer.token_ids),
-                                            'reasoning_tokens': answer_fields['reasoning_tokens'],
-                                            'final_tokens': answer_fields['final_tokens']},
-                                  'raw_output': answer.text, 'utc': now()}
-                    else:
-                        result = {'run_identity': identity, 'unit_id': row['unit_id'],
-                                  'text_sha256': row['text_sha256'], 'chunk_idx': row['chunk_idx'],
-                                  'status': status, 'result': parsed,
-                                  'error': error, 'raw_output': answer.text,
-                                  **answer_fields,
-                                  'input_tokens': count, 'output_tokens': len(answer.token_ids),
-                                  'finish_reason': answer.finish_reason, 'utc': now()}
-                    if top_logprobs(row) is not None:
-                        result['logprobs'] = logprobs
-                    if controls['budget'] is not None:
-                        result['thinking_budget_exhausted'] = budget_exhausted(
-                            answer, answer_fields, controls['budget'], end_ids, start_id)
-                    if 'body' in row:
-                        # Every attempt, the committed one last.
-                        result['attempts'] = list(history.get(i, ())) + [{
-                            'attempt': attempt, 'error': error, 'finish_reason': answer.finish_reason,
-                            'output_tokens': len(answer.token_ids)}]
-                    elif controls['attempts'] > 1:
-                        result['attempt'] = attempt
-                        result['previous_attempts'] = list(history.get(i, ()))
-                    results[i] = result
-                    if error and error.retryable and attempt < controls['attempts']:
-                        history.setdefault(i, []).append({'attempt': attempt, 'error': error,
-                                                          'finish_reason': answer.finish_reason,
-                                                          'output_tokens': len(answer.token_ids),
-                                                          'raw_output': answer.text})
-                        retry.append(i)
-                pending = retry
-                if not pending:
-                    break
+        def assess(row, count, output, attempt, earlier):
+            """The result row for one finished output, and the attempt record to carry into
+            a retry when another attempt is allowed (otherwise None)."""
+            if len(output.outputs) != 1:
+                raise RuntimeError('Expected exactly one model output per unit; batch not committed')
+            answer = output.outputs[0]
+            if answer.finish_reason not in ('stop', 'length', 'repetition'):
+                raise RuntimeError(f'Engine terminated generation ({answer.finish_reason}); '
+                                   'batch not committed, resume to regenerate it')
+            parsed, error, answer_fields = validate_answer(
+                answer, output.prompt_token_ids, count, tokenizer, validator_for(row), enabled)
+            logprobs = None
+            if not error and top_logprobs(row) is not None:
+                try:
+                    logprobs = final_logprobs(answer, answer_fields['reasoning_tokens'] or 0,
+                                             getattr(tokenizer, 'all_special_ids', ()))
+                except ValueError as exc:
+                    parsed, error = None, failure(exc)
+            status = 'failed' if error else 'success'
+            if 'body' in row:
+                # Request rows use the batch-result shape (README.md#result-rows).
+                result = {'run_identity': identity, 'unit_id': row['unit_id'],
+                          'custom_id': row['custom_id'], 'request_sha256': row['request_sha256'],
+                          # The rejected answer stays in content and raw_output.
+                          'status': status, 'result': None if error else parsed, 'error': error,
+                          'content': answer_fields['final_output'],
+                          'reasoning': answer_fields['reasoning'],
+                          'reasoning_complete': answer_fields['reasoning_complete'],
+                          'finish_reason': answer.finish_reason,
+                          'usage': {'prompt_tokens': count, 'completion_tokens': len(answer.token_ids),
+                                    'reasoning_tokens': answer_fields['reasoning_tokens'],
+                                    'final_tokens': answer_fields['final_tokens']},
+                          'raw_output': answer.text, 'utc': now()}
+            else:
+                result = {'run_identity': identity, 'unit_id': row['unit_id'],
+                          'text_sha256': row['text_sha256'], 'chunk_idx': row['chunk_idx'],
+                          'status': status, 'result': parsed,
+                          'error': error, 'raw_output': answer.text,
+                          **answer_fields,
+                          'input_tokens': count, 'output_tokens': len(answer.token_ids),
+                          'finish_reason': answer.finish_reason, 'utc': now()}
+            if top_logprobs(row) is not None:
+                result['logprobs'] = logprobs
+            if controls['budget'] is not None:
+                result['thinking_budget_exhausted'] = budget_exhausted(
+                    answer, answer_fields, controls['budget'], end_ids, start_id)
+            if 'body' in row:
+                # Every attempt, the committed one last.
+                result['attempts'] = list(earlier) + [{
+                    'attempt': attempt, 'error': error, 'finish_reason': answer.finish_reason,
+                    'output_tokens': len(answer.token_ids)}]
+            elif controls['attempts'] > 1:
+                result['attempt'] = attempt
+                result['previous_attempts'] = list(earlier)
+            if error and error.retryable and attempt < controls['attempts']:
+                return result, {'attempt': attempt, 'error': error, 'finish_reason': answer.finish_reason,
+                                'output_tokens': len(answer.token_ids), 'raw_output': answer.text}
+            return result, None
+
+        def commit(results, seconds):
+            """Write one part and its timing record. seconds() is the batch's duration, measured
+            after the write, or for the continuous feed its slowest unit's time in flight;
+            either sets the drain margin."""
+            nonlocal longest_batch_seconds
             part = directory / f'part-{len(list(directory.glob("part-*.jsonl"))):06d}.jsonl'
             if part.exists():
                 raise RuntimeError('Refusing to overwrite committed part')
@@ -738,7 +775,7 @@ def run(resources):
             metrics = metrics_snapshot(llm, enabled=metrics_enabled)
             progress = {'utc': now(), 'committed': len(done), 'expected': len(input_info),
                         'failed': sum(r['status'] != 'success' for r in done.values()),
-                        'batch_units': len(batch), 'batch_seconds': time.monotonic()-begin,
+                        'batch_units': len(results), 'batch_seconds': seconds(),
                         **{f'batch_{k}': v for k, v in token_totals(map(token_counts, results)).items()},
                         'metrics': metrics}
             if controls['attempts'] > 1:
@@ -752,6 +789,89 @@ def run(resources):
                 stream.flush()
                 os.fsync(stream.fileno())
             print(json.dumps({'event': 'batch_committed', **progress}), flush=True)
+
+        if feed['mode'] == 'batch':
+            for batch in batches(units(args.fixtures, args.max_records), tokenizer, config, done):
+                if stopping or time.time() >= drain_at():
+                    break
+                begin = time.monotonic()
+                print(json.dumps({'event': 'batch_start', 'utc': now(), 'committed': len(done),
+                                  'units': len(batch), 'prompt_tokens': sum(b[2] for b in batch)}), flush=True)
+                # Model-output failures are re-run within the batch, before commit, so
+                # resume semantics are unchanged: committed rows are never retried.
+                results, pending, history = [None] * len(batch), list(range(len(batch))), {}
+                for attempt in range(1, controls['attempts'] + 1):
+                    # Finish committing the completed attempt rather than start more
+                    # GPU work after a stop request or deadline.
+                    if attempt > 1 and (stopping or time.time() >= drain_at()):
+                        break
+                    params = sampling if legacy else [
+                        sampling if sampling is not None and attempt == 1 else sampling_for(batch[i][0], attempt)
+                        for i in pending]
+                    attempt_started = time.monotonic()
+                    outputs = llm.chat([batch[i][1] for i in pending], sampling_params=params,
+                                       chat_template_kwargs=config['chat_template_kwargs'], use_tqdm=False)
+                    longest_batch_seconds = max(longest_batch_seconds, time.monotonic() - attempt_started)
+                    if len(outputs) != len(pending):
+                        raise RuntimeError('Missing model outputs; batch not committed')
+                    retry = []
+                    for i, output in zip(pending, outputs):
+                        row, chat, count = batch[i]
+                        results[i], record = assess(row, count, output, attempt, history.get(i, ()))
+                        if record is not None:
+                            history.setdefault(i, []).append(record)
+                            retry.append(i)
+                    pending = retry
+                    if not pending:
+                        break
+                commit(results, lambda: time.monotonic() - begin)
+        else:
+            # Continuous feed: a waiting unit joins as soon as one finishes, instead of the
+            # whole host batch waiting for its slowest unit. The rendered prompt token IDs
+            # go to the engine directly, the same IDs validate_answer checks.
+            source = prepared(units(args.fixtures, args.max_records), tokenizer, config, done)
+            queued, flight, finished = next(source, None), {}, []
+            flight_tokens, slowest, last_commit = 0, 0, time.monotonic()
+
+            def submit(item, attempt, earlier, began):
+                nonlocal flight_tokens
+                row, _, ids = item
+                params = sampling if sampling is not None and attempt == 1 else sampling_for(row, attempt)
+                key = f'{row["unit_id"]}#{attempt}'
+                llm.llm_engine.add_request(key, {'prompt_token_ids': ids}, params)
+                flight[key] = (item, attempt, earlier, began)
+                flight_tokens += len(ids)
+
+            def admit():
+                # host_batch_records/host_batch_tokens bound the work in flight, as they bound a batch.
+                nonlocal queued
+                while (queued is not None and not stopping and time.time() < drain_at()
+                       and len(flight) < config['host_batch_records']
+                       and (not flight or flight_tokens + len(queued[2]) <= config['host_batch_tokens'])):
+                    submit(queued, 1, (), time.monotonic())
+                    queued = next(source, None)
+
+            admit()
+            while flight:
+                for output in llm.llm_engine.step():
+                    if not output.finished:
+                        continue
+                    item, attempt, earlier, began = flight.pop(output.request_id)
+                    flight_tokens -= len(item[2])
+                    result, record = assess(item[0], len(item[2]), output, attempt, earlier)
+                    # As in a batch, no retry starts after a stop request or the drain point.
+                    if record is not None and not stopping and time.time() < drain_at():
+                        submit(item, attempt + 1, [*earlier, record], began)
+                    else:
+                        finished.append(result)
+                        slowest = max(slowest, time.monotonic() - began)
+                admit()
+                # Once draining or stopping, commit each unit as it finishes.
+                closing = stopping or time.time() >= drain_at() or not flight
+                if finished and (closing or len(finished) >= config['host_batch_records']
+                                 or time.monotonic() - last_commit >= feed['commit_seconds']):
+                    commit(finished, lambda: slowest)
+                    finished, slowest, last_commit = [], 0, time.monotonic()
     final = {'utc': now(), 'identity': identity, 'expected': len(input_info),
              'committed': len(done), 'unfinished': len(input_info)-len(done),
              'failed': sum(r['status'] != 'success' for r in done.values()),

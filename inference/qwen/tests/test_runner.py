@@ -301,6 +301,71 @@ class ReasoningTests(unittest.TestCase):
             self.assertFalse({'attempt', 'previous_attempts', 'thinking_budget_exhausted'} & set(rows[0]))
 
 
+    def test_resume_reuses_matching_validation_record(self):
+        # The pre-load pass re-tokenizes every unit (about 20 minutes per large shard);
+        # a resume with an identical identity and runtime skips it.
+        tokenizer, outer = self.tokenizer, self
+        templated = []
+        class CountingTokenizer(FakeTokenizer):
+            def apply_chat_template(self, chat, **kwargs):
+                templated.append(chat)
+                return super().apply_chat_template(chat, **kwargs)
+        tokenizer = CountingTokenizer()
+        class FakeLLM:
+            def __init__(self, **kwargs):
+                pass
+            def chat(self, chats, **kwargs):
+                return [SimpleNamespace(prompt_token_ids=FakeTokenizer().apply_chat_template(
+                    chat, **kwargs['chat_template_kwargs']), outputs=[outer.answer()]) for chat in chats]
+        modules = {
+            'transformers': SimpleNamespace(AutoTokenizer=SimpleNamespace(from_pretrained=lambda *a, **k: tokenizer)),
+            'torch': SimpleNamespace(cuda=SimpleNamespace(device_count=lambda: 1, get_device_name=lambda i: 'fake'),
+                                     __version__='fake', version=SimpleNamespace(cuda='fake')),
+            'vllm': SimpleNamespace(LLM=FakeLLM, SamplingParams=lambda **k: k),
+            'vllm.sampling_params': SimpleNamespace(StructuredOutputsParams=lambda **k: k)}
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(sys.modules, modules), \
+                patch.object(r.signal, 'signal'), contextlib.redirect_stdout(io.StringIO()):
+            root = Path(tmp)
+            cfg, manifest, model = root/'config.json', root/'input.jsonl', root/'model'
+            model.mkdir()
+            (model/'chat_template.jinja').write_text('template v1')
+            (model/'model.safetensors').write_text('weights are not hashed')
+            cfg.write_text(json.dumps({**self.cfg, 'model': str(model)}))
+            manifest.write_text(''.join(json.dumps({'unit_id': str(i), 'chunk_idx': 0,
+                'text': 'evidence', 'text_sha256': r.digest(b'evidence')})+'\n' for i in range(2)))
+            argv = ['runner', '--config', str(cfg), '--input-manifest', str(manifest),
+                    '--output-dir', str(root/'outputs'), '--worker-id', '0']
+            record = root/'outputs/worker-0/validated.json'
+            with patch.object(sys, 'argv', argv+['--validate-only']):
+                r.main()
+            self.assertTrue(record.exists())
+            templated.clear()
+            with patch.object(sys, 'argv', argv+['--validate-only']):
+                r.main()
+            self.assertEqual(len(templated), 2)  # an explicit check always validates
+            with patch.object(sys, 'argv', argv):
+                r.main()
+            self.assertEqual(len(templated), 4)  # first run: the generation pass only
+            templated.clear()
+            with patch.object(sys, 'argv', argv+['--resume']):
+                r.main()
+            self.assertEqual(templated, [])  # everything committed and already validated
+            stale = json.loads(record.read_text())
+            stale['runtime']['python'] = 'other'
+            record.write_text(json.dumps(stale))
+            with patch.object(sys, 'argv', argv+['--resume']):
+                r.main()
+            self.assertEqual(len(templated), 2)  # a changed runtime validates again
+            self.assertEqual(json.loads(record.read_text())['runtime']['python'], sys.version)
+            self.assertEqual(set(json.loads(record.read_text())['runtime']['tokenizer_files']),
+                             {'chat_template.jinja'})
+            (model/'chat_template.jinja').write_text('template edited in place')
+            templated.clear()
+            with patch.object(sys, 'argv', argv+['--resume']):
+                r.main()
+            self.assertEqual(len(templated), 2)  # an edited chat template validates again
+
+
 class EndTokenizer(FakeTokenizer):
     def encode(self, text, add_special_tokens=None):
         head, sep, tail = text.partition('</think>')
@@ -586,6 +651,128 @@ class DecodingControlTests(unittest.TestCase):
         self.assertEqual((rows[0]['thinking_budget_exhausted'], rows[1]['thinking_budget_exhausted']), (True, False))
         self.assertEqual(summary['retried_units'], 1)
         self.assertEqual(summary['retry_output_tokens'], rows[0]['previous_attempts'][0]['output_tokens'])
+
+
+    def _run_feed(self, feed, units=5, stop_after=None, **overrides):
+        """Run the runner with a fake engine that serves both feeds; answers depend only on
+        the prompt and attempt seed, so both feeds must commit the same rows."""
+        tokenizer = EndTokenizer()
+        final = json.dumps(self.result([('e:0', 1)]))
+        handlers, seen = {}, {'chat_calls': 0, 'max_flight': 0, 'prompts': []}
+
+        def answer(prompt_ids, params):
+            # The first attempt on the evidence of unit 0 repeats; its retry (seed + 1) succeeds.
+            text = tokenizer.decode(prompt_ids)
+            finish = 'repetition' if 'evidence-0' in text and params['seed'] == 5 else 'stop'
+            ids = tokenizer.encode('Check.') + [2] + tokenizer.encode(final) + [3]
+            return SimpleNamespace(token_ids=ids, text=tokenizer.decode(ids), finish_reason=finish)
+
+        class FakeEngine:
+            def __init__(self):
+                self.flight = []
+            def add_request(self, request_id, prompt, params):
+                assert params['output_kind'] == 'FINAL_ONLY'
+                self.flight.append((request_id, prompt['prompt_token_ids'], params))
+                seen['max_flight'] = max(seen['max_flight'], len(self.flight))
+                seen['prompts'].append(prompt['prompt_token_ids'])
+            def step(self):
+                # Finish the newest request first, so completion order differs from input order.
+                request_id, ids, params = self.flight.pop()
+                if stop_after is not None and len(seen['prompts']) >= stop_after:
+                    handlers[r.signal.SIGTERM](r.signal.SIGTERM, None)
+                return [SimpleNamespace(request_id='unfinished', finished=False),
+                        SimpleNamespace(request_id=request_id, finished=True, prompt_token_ids=ids,
+                                        outputs=[answer(ids, params)])]
+
+        class FakeLLM:
+            def __init__(self, **kwargs):
+                self.llm_engine = FakeEngine()
+            def chat(self, chats, sampling_params, **kwargs):
+                seen['chat_calls'] += 1
+                out = []
+                for chat, params in zip(chats, sampling_params):
+                    ids = tokenizer.apply_chat_template(chat, **kwargs['chat_template_kwargs'])
+                    out.append(SimpleNamespace(prompt_token_ids=ids, outputs=[answer(ids, params)]))
+                return out
+
+        modules = {
+            'transformers': SimpleNamespace(AutoTokenizer=SimpleNamespace(from_pretrained=lambda *a, **k: tokenizer)),
+            'torch': SimpleNamespace(cuda=SimpleNamespace(device_count=lambda: 1, get_device_name=lambda i: 'fake'),
+                                     __version__='fake', version=SimpleNamespace(cuda='fake')),
+            'vllm': SimpleNamespace(LLM=FakeLLM, SamplingParams=lambda **k: k),
+            'vllm.config': SimpleNamespace(),
+            'vllm.config.reasoning': SimpleNamespace(ReasoningConfig=lambda **k: ('ReasoningConfig', k)),
+            'vllm.sampling_params': SimpleNamespace(
+                StructuredOutputsParams=lambda **k: k, RepetitionDetectionParams=lambda **k: ('Repetition', k),
+                RequestOutputKind=SimpleNamespace(FINAL_ONLY='FINAL_ONLY'))}
+        cfg = dict(self.cfg, model='/fake/qwen', system_prompt='Return JSON.', schema=self.schema,
+                   host_batch_tokens=40000, host_batch_records=2,
+                   retry={'max_attempts': 2, 'temperatures': [0.7]})
+        cfg.update(overrides)
+        cfg['sampling'] = dict(cfg['sampling'], seed=5)
+        if feed:
+            cfg['feed'] = feed
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(sys.modules, modules), \
+                patch.object(r.signal, 'signal', side_effect=lambda sig, fn: handlers.update({sig: fn})), \
+                contextlib.redirect_stdout(io.StringIO()):
+            root = Path(tmp)
+            (root/'config.json').write_text(json.dumps(cfg))
+            (root/'input.jsonl').write_text(''.join(json.dumps(
+                {**self.row, 'unit_id': f'e:w{i}', 'chunk_idx': i, 'text': f'evidence-{i}',
+                 'text_sha256': r.digest(f'evidence-{i}'.encode())})+'\n' for i in range(units)))
+            argv = ['runner', '--config', str(root/'config.json'), '--input-manifest', str(root/'input.jsonl'),
+                    '--output-dir', str(root/'outputs'), '--worker-id', '0']
+            with patch.object(sys, 'argv', argv):
+                with contextlib.suppress(SystemExit):
+                    r.main()
+            worker = root/'outputs/worker-0'
+            rows = [json.loads(line) for part in sorted(worker.glob('part-*.jsonl'))
+                    for line in part.read_text().splitlines()]
+            timings = [json.loads(line) for line in (worker/'timings.jsonl').read_text().splitlines()]
+            summary = json.loads((worker/'summary.json').read_text())
+        for row in rows:
+            del row['utc'], row['run_identity']  # the feed is part of the config, so of the identity
+        return sorted(rows, key=lambda x: x['unit_id']), timings, summary, seen
+
+    def test_continuous_feed_commits_the_same_rows_as_batches(self):
+        batch_rows, _, batch_summary, batch_seen = self._run_feed(None)
+        rows, timings, summary, seen = self._run_feed({'mode': 'continuous', 'commit_seconds': 3600})
+        self.assertEqual(rows, batch_rows)
+        self.assertEqual([x['unit_id'] for x in rows], [f'e:w{i}' for i in range(5)])
+        self.assertEqual(rows[0]['attempt'], 2)  # unit 0 was retried
+        self.assertEqual(rows[0]['previous_attempts'][0]['finish_reason'], 'repetition')
+        self.assertEqual({k: summary[k] for k in ('committed', 'failed', 'unfinished', 'retried_units')},
+                         {k: batch_summary[k] for k in ('committed', 'failed', 'unfinished', 'retried_units')})
+        self.assertEqual(seen['chat_calls'], 0)
+        self.assertGreater(batch_seen['chat_calls'], 0)
+        self.assertLessEqual(seen['max_flight'], 2)  # host_batch_records caps requests in flight
+        tokenizer = EndTokenizer()
+        self.assertEqual(seen['prompts'][0], tokenizer.apply_chat_template(
+            r.messages({'text': 'evidence-0'}, {'system_prompt': 'Return JSON.'}), enable_thinking=True))
+        self.assertEqual(sum(t['batch_units'] for t in timings), 5)
+        self.assertTrue(all(t['batch_seconds'] >= 0 for t in timings))
+
+    def test_continuous_feed_stops_admitting_and_commits_finished_work(self):
+        rows, timings, summary, seen = self._run_feed({'mode': 'continuous'}, units=6, stop_after=2)
+        self.assertEqual(len(seen['prompts']), 2)  # nothing is admitted or retried after the stop request
+        self.assertEqual([(x['unit_id'], x['status']) for x in rows], [('e:w0', 'failed'), ('e:w1', 'success')])
+        self.assertEqual([t['batch_units'] for t in timings], [1, 1])  # each unit commits as it finishes
+        self.assertEqual((summary['committed'], summary['unfinished']), (2, 4))
+
+    def test_continuous_feed_bounds_prompt_tokens_in_flight(self):
+        # Each fake prompt is 35 tokens, so a 40-token cap admits one unit at a time.
+        rows, _, summary, seen = self._run_feed({'mode': 'continuous'}, host_batch_tokens=40)
+        self.assertEqual(seen['max_flight'], 1)
+        self.assertEqual((len(rows), summary['unfinished']), (5, 0))
+
+    def test_feed_options_are_validated(self):
+        self.assertEqual(r.feed_options({}), {'mode': 'batch', 'commit_seconds': 60})
+        self.assertEqual(r.feed_options({'feed': {'mode': 'continuous', 'commit_seconds': 5}}),
+                         {'mode': 'continuous', 'commit_seconds': 5})
+        for bad in ({'mode': 'stream'}, {'mode': 'continuous', 'commit_seconds': 0},
+                    {'mode': 'continuous', 'commit_seconds': True}, {'mode': 'continuous', 'other': 1}, 'continuous'):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                r.feed_options({'feed': bad})
 
 
 if __name__ == '__main__':
